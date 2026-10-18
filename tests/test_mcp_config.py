@@ -1366,6 +1366,59 @@ async def test_multi_server_entry_timeout_applies_per_server():
     assert timeouts == {"server1": 2.0, "server2": 42.0}
 
 
+async def test_single_server_entry_timeout_zero_disables():
+    """A set-but-zero entry timeout disables the session timeout (None), while
+    still overriding a client-level timeout — matching `Client(timeout=0)`
+    semantics via `normalize_timeout_to_seconds` (#5754)."""
+    config = MCPConfig(
+        mcpServers={
+            "remote": RemoteMCPServer(url="http://example.invalid/mcp", timeout=0)
+        }
+    )
+    transport = MCPConfigTransport(config)
+
+    captured = await _captured_session_kwargs(transport, read_timeout_seconds=5.0)
+
+    assert captured["read_timeout_seconds"] is None
+
+
+async def test_multi_server_entry_timeout_zero_disables_per_server():
+    """A zero entry disables that backend alone; backends without an entry
+    keep the client-level timeout (#5754)."""
+    config = MCPConfig(
+        mcpServers={
+            "server1": StdioMCPServer(command="echo", args=["test"], timeout=0),
+            "server2": StdioMCPServer(command="echo", args=["test"]),
+        }
+    )
+    transport = MCPConfigTransport(config)
+
+    mock_create_proxy = AsyncMock(
+        return_value=(AsyncMock(), AsyncMock(), FastMCP(name="MockProxy"))
+    )
+
+    with (
+        patch.object(transport, "_create_proxy", mock_create_proxy),
+        patch(
+            "fastmcp.client.transports.FastMCPTransport.connect_session"
+        ) as mock_connect,
+    ):
+        mock_session = AsyncMock()
+        mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_connect.return_value.__aexit__ = AsyncMock(return_value=None)
+
+        async with transport.connect_session(read_timeout_seconds=42.0):
+            pass
+
+    timeouts = {}
+    for call in mock_create_proxy.call_args_list:
+        name = call[0][0]
+        call_timeout = call[0][2] if len(call[0]) > 2 else call.kwargs.get("timeout")
+        timeouts[name] = call_timeout
+
+    assert timeouts == {"server1": None, "server2": 42.0}
+
+
 def _make_session_server() -> FastMCP:
     app = FastMCP()
 

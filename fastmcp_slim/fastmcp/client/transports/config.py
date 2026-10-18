@@ -23,6 +23,7 @@ from fastmcp.mcp_config import (
     _coerce_tool_transform_configs,
 )
 from fastmcp.utilities.logging import get_logger
+from fastmcp.utilities.timeout import normalize_timeout_to_seconds
 
 if TYPE_CHECKING:
     from mcp.server.request_state import RequestStateSecurity
@@ -32,16 +33,18 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
-def _entry_timeout_seconds(config: MCPServerTypes) -> float | None:
-    """The per-server read timeout a config entry declares, in seconds.
+def _entry_timeout_seconds(config: MCPServerTypes) -> tuple[bool, float | None]:
+    """Whether a config entry declares a timeout, and that timeout in seconds.
 
     Config entries declare `timeout` in milliseconds (the `mcp.json`
     convention the config format follows); session read timeouts are seconds.
-    Returns None when the entry declares no timeout.
+    A set-but-zero entry disables the timeout (None), matching
+    `Client(timeout=0)` semantics — while still overriding an unset or
+    default client-level timeout, which an omitted field must not do.
     """
     if config.timeout is None:
-        return None
-    return config.timeout / 1000
+        return False, None
+    return True, normalize_timeout_to_seconds(config.timeout / 1000)
 
 
 class MCPConfigTransport(ClientTransport):
@@ -149,10 +152,11 @@ class MCPConfigTransport(ClientTransport):
         if len(self.config.mcpServers) == 1:
             # An entry-level `timeout` is the more specific setting, so it wins
             # over the client-level timeout the session kwargs carry (#5754).
-            entry_timeout = _entry_timeout_seconds(
+            # A set-but-zero entry disables (None) rather than firing at 0.0s.
+            entry_set, entry_timeout = _entry_timeout_seconds(
                 next(iter(self.config.mcpServers.values()))
             )
-            if entry_timeout is not None:
+            if entry_set:
                 session_kwargs["read_timeout_seconds"] = entry_timeout
             async with self.transport.connect_session(
                 transport_options=transport_options, **session_kwargs
@@ -270,11 +274,12 @@ class MCPConfigTransport(ClientTransport):
             try:
                 # An entry-level `timeout` applies to this backend alone;
                 # backends without one keep the client-level timeout (#5754).
-                entry_timeout = _entry_timeout_seconds(server_config)
+                # A set-but-zero entry disables (None) rather than firing at 0.0s.
+                entry_set, entry_timeout = _entry_timeout_seconds(server_config)
                 connected_transport, client, proxy = await self._create_proxy(
                     name,
                     server_config,
-                    entry_timeout if entry_timeout is not None else timeout,
+                    entry_timeout if entry_set else timeout,
                     stack,
                     current_mode,
                     transport=transport,
